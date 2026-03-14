@@ -1,64 +1,181 @@
 #include <Arduino.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
-#define USE_SERIAL Serial
-#define OLED_SDA 4
-#define OLED_SCL 15 
-#define OLED_RST 16
-#define SCREEN_WIDTH 128 // OLED display width, in pixels
-#define SCREEN_HEIGHT 64 // OLED display height, in pixels
-#define uS_TO_S_FACTOR 1000000
-#define TIME_TO_SLEEP  5
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <esp_sleep.h>
 
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RST);
+#include "env.h"
 
-const int outputPin = 16;
-const int inputPin = 35;
-int threshold = 2000;
-int waterScore = 0;
-int maxScore = 100000;
+static const uint64_t US_TO_S_FACTOR = 1000000ULL;
+static const uint64_t SLEEP_SECONDS = 2; // 3600ULL;
+static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 30000;
+static const uint32_t HTTP_TIMEOUT_MS = 10000;
+static const uint32_t MAX_WATERING_SECONDS = 3600;
+static const int PUMP_PIN = 4;
 
-const int pumpPin = 4;
+static bool connectToWifi()
+{
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-int outputPinValue = 0; 
-int inputPinValue = 0;
+  const unsigned long startMs = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startMs < WIFI_CONNECT_TIMEOUT_MS)
+  {
+    delay(250);
+  }
 
-int state = 0;
-
-void setup() {
-    pinMode(outputPin, OUTPUT);
-    pinMode(inputPin, INPUT_PULLDOWN);
-    pinMode(pumpPin, OUTPUT);
-    digitalWrite(pumpPin, LOW);
-    digitalWrite(outputPin, HIGH);
-    USE_SERIAL.begin(115200);
+  return WiFi.status() == WL_CONNECTED;
 }
 
-void loop() {
-  inputPinValue = analogRead(inputPin);
-  String p1=";";
-  USE_SERIAL.println(waterScore + p1 + state + p1 + inputPinValue);
-  delay(100);
-  switch (state) {
-    case 0:
-          threshold = 2000;
-          if (waterScore > maxScore - 10) {
-            digitalWrite(pumpPin, HIGH);
-            state = 1;
-          }
-    break;
-    case 1:
-          threshold = 3000;
-          if (waterScore < maxScore - 20) {
-            digitalWrite(pumpPin, HIGH);
-            state = 0;
-          }
-    break;
+static bool fetchWateringInstruction(bool &wateringNeeded, uint32_t &durationSeconds)
+{
+  String url = String(API_BASE_URL) + "/esp/is_watering_needed?plant_id=" + PLANT_ID + "&token=" + API_TOKEN;
+
+  WiFiClient client;
+  HTTPClient http;
+  http.setTimeout(HTTP_TIMEOUT_MS);
+
+  if (!http.begin(client, url))
+  {
+    Serial.println("Failed to initialize watering check request");
+    return false;
   }
-  if (inputPinValue < threshold) {
-    waterScore = min(waterScore + 1, maxScore);
+
+  const int httpCode = http.GET();
+  if (httpCode != HTTP_CODE_OK)
+  {
+    Serial.print("Watering check failed with HTTP code: ");
+    Serial.println(httpCode);
+    http.end();
+    return false;
   }
-  else {
-    waterScore = max(waterScore - 1, -maxScore);
+
+  DynamicJsonDocument doc(512);
+  const String payload = http.getString();
+  http.end();
+
+  DeserializationError error = deserializeJson(doc, payload);
+  if (error)
+  {
+    Serial.print("Invalid JSON from watering check: ");
+    Serial.println(error.c_str());
+    return false;
   }
+
+  wateringNeeded = doc["watering_needed"] | false;
+  durationSeconds = doc["duration"] | 0;
+  if (durationSeconds > MAX_WATERING_SECONDS)
+  {
+    durationSeconds = MAX_WATERING_SECONDS;
+  }
+
+  return true;
+}
+
+static bool notifyWateringStatus(const char *status)
+{
+  String url = String(API_BASE_URL) + "/esp/water_plant";
+
+  WiFiClient client;
+  HTTPClient http;
+  http.setTimeout(HTTP_TIMEOUT_MS);
+
+  if (!http.begin(client, url))
+  {
+    Serial.println("Failed to initialize water_plant request");
+    return false;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+
+  DynamicJsonDocument body(256);
+  body["plant_id"] = PLANT_ID;
+  body["status"] = status;
+  body["token"] = API_TOKEN;
+
+  String requestBody;
+  serializeJson(body, requestBody);
+
+  const int httpCode = http.POST(requestBody);
+  if (httpCode < 200 || httpCode >= 300)
+  {
+    Serial.print("water_plant status update failed (HTTP ");
+    Serial.print(httpCode);
+    Serial.println(")");
+    http.end();
+    return false;
+  }
+
+  http.end();
+  return true;
+}
+
+static void waterPlantForDuration(uint32_t durationSeconds)
+{
+  if (durationSeconds == 0)
+  {
+    return;
+  }
+
+  durationSeconds = min(durationSeconds, MAX_WATERING_SECONDS);
+
+  notifyWateringStatus("started");
+
+  digitalWrite(PUMP_PIN, HIGH);
+  delay(durationSeconds * 1000UL);
+  digitalWrite(PUMP_PIN, LOW);
+
+  notifyWateringStatus("completed");
+}
+
+static void sleepOneCycle()
+{
+  esp_sleep_enable_timer_wakeup(SLEEP_SECONDS * US_TO_S_FACTOR);
+  esp_deep_sleep_start();
+}
+
+void setup()
+{
+  Serial.begin(115200);
+  Serial.println("Starting up...");
+
+  pinMode(PUMP_PIN, OUTPUT);
+  digitalWrite(PUMP_PIN, LOW);
+
+  if (connectToWifi())
+  {
+    Serial.println("WiFi connected");
+
+    bool wateringNeeded = false;
+    uint32_t durationSeconds = 0;
+
+    if (fetchWateringInstruction(wateringNeeded, durationSeconds))
+    {
+      Serial.print("Watering needed: ");
+      Serial.println(wateringNeeded ? "true" : "false");
+
+      if (wateringNeeded)
+      {
+        Serial.print("Watering duration (s): ");
+        Serial.println(durationSeconds);
+        waterPlantForDuration(durationSeconds);
+      }
+    }
+  }
+  else
+  {
+    Serial.println("WiFi connection failed");
+  }
+
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+
+  Serial.println("Entering deep sleep...");
+
+  sleepOneCycle();
+}
+
+void loop()
+{
+  // Device always deep-sleeps at the end of setup().
 }
