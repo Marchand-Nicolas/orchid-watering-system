@@ -8,7 +8,7 @@
 #include "env.h"
 
 static const uint64_t US_TO_S_FACTOR = 1000000ULL;
-static const uint64_t SLEEP_SECONDS = 2; // 3600ULL;
+static const uint64_t SLEEP_SECONDS = 3600ULL;
 static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 30000;
 static const uint8_t WIFI_CONNECT_ATTEMPTS = 3;
 static const uint32_t HTTP_TIMEOUT_MS = 10000;
