@@ -3,28 +3,135 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <esp_sleep.h>
+#include <esp_wifi.h>
 
 #include "env.h"
 
 static const uint64_t US_TO_S_FACTOR = 1000000ULL;
 static const uint64_t SLEEP_SECONDS = 2; // 3600ULL;
 static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 30000;
+static const uint8_t WIFI_CONNECT_ATTEMPTS = 3;
 static const uint32_t HTTP_TIMEOUT_MS = 10000;
 static const uint32_t MAX_WATERING_SECONDS = 3600;
 static const int PUMP_PIN = 4;
 
+static const char *wifiStatusToString(wl_status_t status)
+{
+  switch (status)
+  {
+  case WL_IDLE_STATUS:
+    return "IDLE";
+  case WL_NO_SSID_AVAIL:
+    return "NO_SSID_AVAIL";
+  case WL_SCAN_COMPLETED:
+    return "SCAN_COMPLETED";
+  case WL_CONNECTED:
+    return "CONNECTED";
+  case WL_CONNECT_FAILED:
+    return "CONNECT_FAILED";
+  case WL_CONNECTION_LOST:
+    return "CONNECTION_LOST";
+  case WL_DISCONNECTED:
+    return "DISCONNECTED";
+  default:
+    return "UNKNOWN";
+  }
+}
+
 static bool connectToWifi()
 {
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi SSID: ");
+  Serial.println(WIFI_SSID);
 
-  const unsigned long startMs = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startMs < WIFI_CONNECT_TIMEOUT_MS)
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+
+  wl_status_t finalStatus = WL_DISCONNECTED;
+
+  for (uint8_t attempt = 1; attempt <= WIFI_CONNECT_ATTEMPTS; ++attempt)
   {
-    delay(250);
+    Serial.print("WiFi connect attempt ");
+    Serial.print(attempt);
+    Serial.print("/");
+    Serial.println(WIFI_CONNECT_ATTEMPTS);
+
+    WiFi.disconnect(false, true);
+    delay(200);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    const unsigned long startMs = millis();
+    wl_status_t lastStatus = WiFi.status();
+    unsigned long lastProgressLogMs = 0;
+
+    Serial.print("Initial WiFi status: ");
+    Serial.print(wifiStatusToString(lastStatus));
+    Serial.print(" (");
+    Serial.print(static_cast<int>(lastStatus));
+    Serial.println(")");
+
+    while (WiFi.status() != WL_CONNECTED && millis() - startMs < WIFI_CONNECT_TIMEOUT_MS)
+    {
+      const wl_status_t currentStatus = WiFi.status();
+      if (currentStatus != lastStatus)
+      {
+        Serial.print("WiFi status changed: ");
+        Serial.print(wifiStatusToString(currentStatus));
+        Serial.print(" (");
+        Serial.print(static_cast<int>(currentStatus));
+        Serial.println(")");
+        lastStatus = currentStatus;
+      }
+
+      if (millis() - lastProgressLogMs >= 5000)
+      {
+        const unsigned long elapsedSeconds = (millis() - startMs) / 1000;
+        Serial.print("Still connecting... elapsed ");
+        Serial.print(elapsedSeconds);
+        Serial.print("s, status ");
+        Serial.print(wifiStatusToString(currentStatus));
+        Serial.print(" (");
+        Serial.print(static_cast<int>(currentStatus));
+        Serial.println(")");
+        lastProgressLogMs = millis();
+      }
+
+      delay(250);
+    }
+
+    finalStatus = WiFi.status();
+    if (finalStatus == WL_CONNECTED)
+    {
+      Serial.print("WiFi connected on attempt ");
+      Serial.println(attempt);
+      Serial.print("IP: ");
+      Serial.println(WiFi.localIP());
+      Serial.print("RSSI (dBm): ");
+      Serial.println(WiFi.RSSI());
+      Serial.print("Channel: ");
+      Serial.println(WiFi.channel());
+      return true;
+    }
+
+    Serial.print("Attempt failed after ");
+    Serial.print((millis() - startMs) / 1000);
+    Serial.println("s");
+    Serial.print("Attempt final status: ");
+    Serial.print(wifiStatusToString(finalStatus));
+    Serial.print(" (");
+    Serial.print(static_cast<int>(finalStatus));
+    Serial.println(")");
   }
 
-  return WiFi.status() == WL_CONNECTED;
+  Serial.println("All WiFi connection attempts failed");
+  Serial.print("Final WiFi status: ");
+  Serial.print(wifiStatusToString(finalStatus));
+  Serial.print(" (");
+  Serial.print(static_cast<int>(finalStatus));
+  Serial.println(")");
+
+  return finalStatus == WL_CONNECTED;
 }
 
 static bool fetchWateringInstruction(bool &wateringNeeded, uint32_t &durationSeconds)
